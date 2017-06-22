@@ -30,44 +30,40 @@ static const char *EVT_ADDR = "address";
 static const char *EVT_MESSAGE = "message";
 
 /* max number of iterations to wait when terminating recv thread */
-static const int RECEIVE_THREAD_TERMINATION_MAXWAIT =  5; /* x 200ms = 1s */
+static const int RECEIVE_THREAD_TERMINATION_CYCLES =  5;  /* x 200ms = 1s */
+static const uint32_t RECEIVE_THREAD_TERMINATION_DELAY = 200;
+
 static const size_t RECEIVE_THREAD_DEFAULT_BUFSIZE = 4096; /* 4k */
 
-/** -- static prototypes ------------------------------------------------------------------------------------------- */
+/** -- static helpers prototypes ----------------------------------------------------------------------------------- */
 static void delay(uint32_t millis);
-static const char *frame_msg_type(eventbus_frame_t type);
-
+static const char *message_type(eventbus_message_t type);
 static unsigned long address_hash(void *address);
 static int address_equal(void *addr1, void *addr2);
-
-static int post_message(eventbus_t *instance, eventbus_frame_t frame_type, const char *address,
+static int post_message(eventbus_t *instance, eventbus_message_t message_type, const char *address,
                         const char *reply_address, json_t *headers, json_t *body);
-
 static ssize_t receive(int fd, void *dest, size_t len);
 static void *receive_message_loop(void *dummy);
-static void shutdown_client(eventbus_t *instance);
+static void do_shutdown(eventbus_t *instance);
 
-static pthread_attr_t default_thread_attrs;
-static pthread_mutexattr_t default_mutex_attrs;
-
-/* -- getters ------------------------------------------------------------------------------------------------------ */
+/** -- library functions ------------------------------------------------------------------------------------------- */
 const char *eventbus_node(eventbus_t *instance)
 {
     assert(instance);
     return instance->node;
-}
+} /* eventbus_node() */
 
 const char *eventbus_service(eventbus_t *instance)
 {
     assert(instance);
     return instance->service;
-}
+} /* eventbus_service() */
 
 void* eventbus_user(eventbus_t *instance)
 {
     assert(instance);
     return instance->user;
-}
+} /* eventbus_user() */
 
 eventbus_t *eventbus_create(const char *node, const char *service, handler_t error_handler, void *user)
 {
@@ -99,6 +95,7 @@ eventbus_t *eventbus_create(const char *node, const char *service, handler_t err
     instance->error = EVENTBUS_ERROR_NOERROR;
 
     /* instance mutex setup with defaults */
+    pthread_mutexattr_t default_mutex_attrs;
     pthread_mutexattr_init(&default_mutex_attrs);
     pthread_mutex_init(&instance->object_mutex, &default_mutex_attrs);
 
@@ -118,7 +115,7 @@ eventbus_state_t eventbus_state(eventbus_t *instance)
     RELEASE_LOCK(instance->object);
 
     return ret;
-}
+} /* eventbus_state() */
 
 eventbus_error_t eventbus_error(eventbus_t *instance)
 {
@@ -130,7 +127,7 @@ eventbus_error_t eventbus_error(eventbus_t *instance)
     RELEASE_LOCK(instance->object);
 
     return ret;
-}
+} /* eventbus_error() */
 
 int eventbus_start(eventbus_t *instance)
 {
@@ -210,7 +207,7 @@ int eventbus_stop(eventbus_t *instance)
     assert(instance);
 
     ACQUIRE_LOCK(instance->object);
-    shutdown_client(instance);
+    do_shutdown(instance);
     RELEASE_LOCK(instance->object);
 
     return 0;
@@ -223,7 +220,7 @@ int eventbus_destroy(eventbus_t *instance)
     ACQUIRE_LOCK(instance->object);
 
     /* does nothing if already idle */
-    shutdown_client(instance);
+    do_shutdown(instance);
 
     free(instance->service);
     instance->service = NULL;
@@ -243,11 +240,11 @@ int eventbus_ping(eventbus_t *instance)
     assert(instance);
 
     ACQUIRE_LOCK(instance->object);
-    int ret = post_message(instance, FRAME_PING, NULL, NULL, NULL, NULL);
+    int ret = post_message(instance, MESSAGE_PING, NULL, NULL, NULL, NULL);
     RELEASE_LOCK(instance->object);
 
     return ret;
-}
+} /* eventbus_ping() */
 
 int eventbus_send(eventbus_t *instance, const char *address, const char *reply_address,
                    json_t *headers, json_t *body)
@@ -255,11 +252,11 @@ int eventbus_send(eventbus_t *instance, const char *address, const char *reply_a
     assert(instance);
 
     ACQUIRE_LOCK(instance->object);
-    int ret = post_message(instance, FRAME_SEND, address, reply_address, headers, body);
+    int ret = post_message(instance, MESSAGE_SEND, address, reply_address, headers, body);
     RELEASE_LOCK(instance->object);
 
     return ret;
-}
+} /* eventbus_send() */
 
 int eventbus_publish(eventbus_t *instance, const char *address,
                      json_t *headers, json_t *body)
@@ -268,13 +265,12 @@ int eventbus_publish(eventbus_t *instance, const char *address,
 
     ACQUIRE_LOCK(instance->object);
     /* reply_address is unused in PUBLISH messages */
-    int ret = post_message(instance, FRAME_PUBLISH, address, NULL, headers, body);
+    int ret = post_message(instance, MESSAGE_PUBLISH, address, NULL, headers, body);
     RELEASE_LOCK(instance->object);
 
     return ret;
-}
+} /* eventbus_publish() */
 
-/* returns 0 if handler was successfully registered, -1 otherwise */
 int eventbus_register(eventbus_t *instance, const char *address, handler_t handler)
 {
     assert(instance);
@@ -286,7 +282,7 @@ int eventbus_register(eventbus_t *instance, const char *address, handler_t handl
         if (! lookup) {
             /* keys inserted in the hash table must be privately owned */
             hash_table_insert(instance->handlers, strdup(address), handler);
-            ret = post_message(instance, FRAME_REGISTER, address, NULL, NULL, NULL);
+            ret = post_message(instance, MESSAGE_REGISTER, address, NULL, NULL, NULL);
         } else ret = -1;
     } else ret = -1;
     RELEASE_LOCK(instance->object);
@@ -294,7 +290,6 @@ int eventbus_register(eventbus_t *instance, const char *address, handler_t handl
     return ret;
 } /* eventbus_register_handler() */
 
-/* returns 0 if handler was successfully unregistered, -1 otherwise */
 int eventbus_unregister(eventbus_t *instance, const char *address)
 {
     assert(instance);
@@ -306,7 +301,7 @@ int eventbus_unregister(eventbus_t *instance, const char *address)
         if (lookup) {
             /* keys inserted in the hash table must be privately owned */
             hash_table_remove(instance->handlers, (void *) address);
-            ret = post_message(instance, FRAME_UNREGISTER, address, NULL, NULL, NULL);
+            ret = post_message(instance, MESSAGE_UNREGISTER, address, NULL, NULL, NULL);
         } else ret = -1;
     } else ret = -1;
     RELEASE_LOCK(instance->object);
@@ -314,7 +309,7 @@ int eventbus_unregister(eventbus_t *instance, const char *address)
     return ret;
 } /* eventbus_unregister_handler() */
 
-/** -- internals --------------------------------------------------------------------------------------------------- */
+/** -- static helpers ---------------------------------------------------------------------------------------------- */
 static void delay(uint32_t millis)
 {
     uint32_t total = 1000 * millis;
@@ -325,33 +320,33 @@ static void delay(uint32_t millis)
 
     /* just waiting for timeout (cfr. select man page) */
     select(0, NULL, NULL, NULL, &timeout);
-}
+} /* delay() */
 
-static const char *frame_msg_type(eventbus_frame_t type)
+static const char *message_type(eventbus_message_t type)
 {
-    static const char *FRAME_PING_STR = "ping";
-    static const char *FRAME_SEND_STR = "send";
-    static const char *FRAME_PUBLISH_STR = "publish";
-    static const char *FRAME_REGISTER_STR = "register";
-    static const char *FRAME_UNREGISTER_STR = "unregister";
+    static const char *MESSAGE_PING_STR = "ping";
+    static const char *MESSAGE_SEND_STR = "send";
+    static const char *MESSAGE_PUBLISH_STR = "publish";
+    static const char *MESSAGE_REGISTER_STR = "register";
+    static const char *MESSAGE_UNREGISTER_STR = "unregister";
 
-    if (type == FRAME_PING)
-        return FRAME_PING_STR;
+    if (type == MESSAGE_PING)
+        return MESSAGE_PING_STR;
 
-    if (type == FRAME_SEND)
-        return FRAME_SEND_STR;
+    if (type == MESSAGE_SEND)
+        return MESSAGE_SEND_STR;
 
-    if (type == FRAME_PUBLISH)
-        return FRAME_PUBLISH_STR;
+    if (type == MESSAGE_PUBLISH)
+        return MESSAGE_PUBLISH_STR;
 
-    if (type == FRAME_REGISTER)
-        return FRAME_REGISTER_STR;
+    if (type == MESSAGE_REGISTER)
+        return MESSAGE_REGISTER_STR;
 
-    if (type == FRAME_UNREGISTER)
-        return FRAME_UNREGISTER_STR;
+    if (type == MESSAGE_UNREGISTER)
+        return MESSAGE_UNREGISTER_STR;
 
     assert(0); /* unreachable */
-}
+} /* message_type() */
 
 static unsigned long address_hash(void *address_)
 {
@@ -363,16 +358,16 @@ static unsigned long address_hash(void *address_)
         hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
 
     return hash;
-}
+} /* address_hash() */
 
 static int address_equal(void *addr1_, void *addr2_)
 {
     char *addr1 = (char *) addr1_;
     char *addr2 = (char *) addr2_;
     return ! strcmp(addr1, addr2);
-}
+} /* address_equal() */
 
-static int post_message(eventbus_t *instance, eventbus_frame_t frame_type, const char *address,
+static int post_message(eventbus_t *instance, eventbus_message_t type, const char *address,
                         const char *reply_address, json_t *headers, json_t *body)
 {
     int ret = 0;
@@ -382,7 +377,7 @@ static int post_message(eventbus_t *instance, eventbus_frame_t frame_type, const
         json_t* out = json_object();
 
         json_object_set_new(out, "type",
-                            json_string(frame_msg_type(frame_type)));
+                            json_string(message_type(type)));
 
         if (address)
             json_object_set_new(out, "address",
@@ -433,10 +428,10 @@ static int post_message(eventbus_t *instance, eventbus_frame_t frame_type, const
     } else ret = -1;
 
     return ret;
-}
+} /* post_message() */
 
 /* receives full fragment of requested len or nothing at all */
-ssize_t receive(int fd, void *dest, size_t len)
+static ssize_t receive(int fd, void *dest, size_t len)
 {
     ssize_t received = recv(fd, dest, len, MSG_DONTWAIT | MSG_PEEK);
 
@@ -450,15 +445,15 @@ ssize_t receive(int fd, void *dest, size_t len)
     assert(received == len); /* here we got full message */
 
     return received;
-}
+} /* receive() */
 
 static void* receive_message_loop(void *ctx)
 {
     eventbus_t *instance = (eventbus_t *) ctx;
     assert(instance);
 
-    size_t frame_len;
-    char *frame_buf = malloc(instance->receive_bufsize); /* initial bufsize, may change overtime */
+    size_t message_len;
+    char *message_buf = malloc(instance->receive_bufsize); /* initial bufsize, may change overtime */
 
     json_t *obj;
     json_error_t error;
@@ -468,20 +463,20 @@ static void* receive_message_loop(void *ctx)
     while (1) {
         switch(instance->receive_fsm) {
         case RECV_LENGTH:
-            /* Waiting for frame length */
-            rc = receive(instance->socket, &frame_len, sizeof(uint32_t));
+            /* Waiting for message length */
+            rc = receive(instance->socket, &message_len, sizeof(uint32_t));
             if (0 < rc) {
                 if (rc == sizeof(uint32_t)) {
-                    frame_len = ntohl(frame_len);
+                    message_len = ntohl(message_len);
 
                     int changed = 0;
-                    while (frame_len >= instance->receive_bufsize) {
+                    while (message_len >= instance->receive_bufsize) {
                         instance->receive_bufsize *= 2;
                         changed = 1;
                     }
 
                     if (changed)
-                        frame_buf = realloc(frame_buf, instance->receive_bufsize);
+                        message_buf = realloc(message_buf, instance->receive_bufsize);
 
                     instance->receive_fsm = RECV_BODY;
                 } else {
@@ -491,12 +486,12 @@ static void* receive_message_loop(void *ctx)
             break; /* RECV_LENGTH */
 
         case RECV_BODY:
-            /* Waiting for frame body */
-            assert(frame_len < instance->receive_bufsize);
+            /* Waiting for message body */
+            assert(message_len < instance->receive_bufsize);
 
-            rc = receive(instance->socket, frame_buf, frame_len);
+            rc = receive(instance->socket, message_buf, message_len);
             if (0 < rc) {
-                instance->receive_fsm = (rc == frame_len)
+                instance->receive_fsm = (rc == message_len)
                     ? RECV_PROCESS
                     : RECV_ERROR ;
             }
@@ -504,8 +499,8 @@ static void* receive_message_loop(void *ctx)
 
         case RECV_PROCESS:
             /* Got all message */
-            frame_buf[frame_len] = '\0';
-            obj = json_loads(frame_buf, 0, &error);
+            message_buf[message_len] = '\0';
+            obj = json_loads(message_buf, 0, &error);
             if (obj) {
                 const char *type = json_string_value(json_object_get(obj, EVT_TYPE));
                 if (! strcmp(type, EVT_TYPE_MESSAGE)) {
@@ -553,19 +548,19 @@ static void* receive_message_loop(void *ctx)
     } /* while() */
 
  leave:
-    free(frame_buf);
+    free(message_buf);
     return NULL;
-}
+} /* receive_message_loop() */
 
-static void shutdown_client(eventbus_t *instance)
+static void do_shutdown(eventbus_t *instance)
 {
     if (instance->state == EVENTBUS_STATE_RUNNING) {
-        int maxwait = RECEIVE_THREAD_TERMINATION_MAXWAIT;
+        int cycles = RECEIVE_THREAD_TERMINATION_CYCLES;
         instance->shutdown = 1; /* require shutdown */
-        while (maxwait --) {
-            delay(200);
-            if (! instance->shutdown) /* shutdown completed */
-                break;
+        while (cycles --) {
+            delay(RECEIVE_THREAD_TERMINATION_DELAY);
+            if (! instance->shutdown)
+                break; /* shutdown completed */
         }
 
         /* recv thread is done, free resources */
@@ -580,5 +575,5 @@ static void shutdown_client(eventbus_t *instance)
         close(instance->socket);
 
     instance->state = EVENTBUS_STATE_IDLE;
-}
+} /* do_shutdown() */
 

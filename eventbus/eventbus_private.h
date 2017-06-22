@@ -18,12 +18,12 @@
 
 /* -- private enums ------------------------------------------------------------------------------------------------ */
 typedef enum {
-    FRAME_PING,
-    FRAME_SEND,
-    FRAME_PUBLISH,
-    FRAME_REGISTER,
-    FRAME_UNREGISTER
-} eventbus_frame_t;
+    MESSAGE_PING,
+    MESSAGE_SEND,
+    MESSAGE_PUBLISH,
+    MESSAGE_REGISTER,
+    MESSAGE_UNREGISTER
+} eventbus_message_t;
 
 typedef enum {
     RECV_LENGTH,
